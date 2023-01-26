@@ -2,7 +2,7 @@ import os
 import logging
 from typing import Union, Tuple
 import subprocess
- 
+
 import boto3
 import botocore
 
@@ -22,6 +22,7 @@ s3 = boto3.client("s3")
 
 def handler(event, context) -> dict:
     logger.debug("videocloud_ffmpeg called: %s", event)
+    logger.debug("running ffmpeg version: %s", get_ffmpeg_version())
 
     s3_bucket = event["Records"][0]["s3"]["bucket"]["name"]
     s3_key = event["Records"][0]["s3"]["object"]["key"]
@@ -34,24 +35,26 @@ def handler(event, context) -> dict:
 
     # Set video path in temporary directory
     local_video_path = f"{TEMP_DIR}/{source_video_file_name}"
+    rendered_file_path = f"{TEMP_DIR}/rendered_video.mp4"
 
     check_available_space(s3_bucket, s3_key)
 
     if not download_video(s3_bucket, s3_key, local_video_path):
         raise Exception("download failed")
 
-    if not render_video(local_video_path):
+    if not render_video(local_video_path, rendered_file_path):
         raise Exception("rendering failed")
 
-    if not upload_video(s3_bucket, s3_key, local_video_path):
+    if not upload_video(s3_bucket, s3_key, rendered_file_path):
         raise Exception("upload failed")
 
     # No longer need source file
-    clean_up_file(local_video_path)
+    if not clean_up_file(local_video_path):
+        logger.info("failed to remove source file: %s", local_video_path)
+    if not clean_up_file(rendered_file_path):
+        logger.info("failed to remove source file: %s", rendered_file_path)
 
-    response = {}
-
-    return response
+    return {"data": "success"}
 
 
 def download_video(s3_bucket: str, s3_key: str, file_path: str) -> bool:
@@ -74,12 +77,8 @@ def upload_video(s3_bucket: str, s3_key: str, file_path: str) -> bool:
     return success
 
 
-def render_video(
-    file_path: str,
-) -> bool:
+def render_video(file_path: str, rendered_file: str) -> bool:
     success = True
-
-    rendered_file = f"{TEMP_DIR}/rendered_video.mp4"
 
     if not os.path.isfile(file_path):
         raise Exception("video file not downloaded")
@@ -146,13 +145,16 @@ def get_obj_file_size(bucket: str, key: str) -> Union[int, None]:
     return object_size
 
 
-def clean_up_file(path: str) -> None:
+def clean_up_file(path: str) -> bool:
+    success = True
     if path and os.path.exists(path):
         logger.debug("Removing: %s", path)
         try:
             os.remove(path)
         except:
+            success = False
             pass
+    return success
 
 
 def get_available_space(path: str) -> Tuple[int, int]:
