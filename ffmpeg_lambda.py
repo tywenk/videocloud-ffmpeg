@@ -3,13 +3,15 @@ import logging
 from typing import Union, Tuple
 import subprocess
 from urllib.parse import unquote
+from pathlib import Path
+import shutil
 
 import boto3
 import botocore
 
 RUNNING_IN_LAMBDA = os.environ.get("LAMBDA_TASK_ROOT")
 if RUNNING_IN_LAMBDA:
-    FFMPEG_DIR = "/opt/bin/ffmpeg"
+    FFMPEG_DIR = "/opt/ffmpeg"
     TEMP_DIR = "/tmp"
 else:
     FFMPEG_DIR = "/opt/homebrew/bin/ffmpeg"
@@ -24,112 +26,110 @@ S3_SOURCE_BUCKET = "videocloud-s3"
 S3_SOURCE_PATH = "uploads/"
 S3_RENDERED_PATH = "rendered/"
 
-tasks_types = ["render", "segment", "obj_detect"]
 
+def get_ffmpeg_command(
+    task: str, file_path: str = "", rendered_file_path: str = ""
+) -> Tuple[Union[list, None], list]:
 
-def handler(event, context) -> dict:
-    logger.debug("videocloud_ffmpeg called: %s", event)
-    logger.debug("running ffmpeg version: %s", get_ffmpeg_version())
+    command_header = [
+        FFMPEG_DIR,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-i",
+        file_path,
+    ]
 
-    filename = unquote(event.get("filename", ""))
-    tasks = event.get("tasks", None)
+    command_footer = [
+        "-profile:v",
+        "baseline",
+        "-y",
+        rendered_file_path,
+    ]
 
-    logger.info("filename: %s, tasks: %s", filename, tasks)
+    ffmpeg_tasks = {
+        "h264_mp4_light": [
+            *command_header,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "26",
+            *command_footer,
+        ],
+        "h264_mp4_medium": [
+            *command_header,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "medium",
+            "-crf",
+            "22",
+            *command_footer,
+        ],
+    }
 
-    s3_bucket = S3_SOURCE_BUCKET
-    s3_key = S3_SOURCE_PATH + filename
-    rendered_s3_key = S3_RENDERED_PATH + filename
+    command = []
+    if task not in ffmpeg_tasks.keys():
+        command = None
+    else:
+        command = ffmpeg_tasks[task]
+    task_types = ffmpeg_tasks.keys()
 
-    assert s3_key != S3_SOURCE_PATH, "filename is required"
-    assert filename, "filename is required"
-    for task in tasks:
-        assert task, "task is required"
-        assert task in tasks_types, f"task must be one of: {tasks_types}"
-
-    logger.info("bucket: %s, key: %s, task: %s", s3_bucket, s3_key, task)
-
-    # Set video path in temporary directory
-    local_video_path = f"{TEMP_DIR}/{filename}"
-    rendered_file_path = f"{TEMP_DIR}/{filename}_rendered.mp4"
-
-    check_available_space(s3_bucket, s3_key)
-
-    logger.info("downloading video from key: %s", s3_key)
-    if not download_video(s3_bucket, s3_key, local_video_path):
-        raise Exception("download failed, file may not exist")
-
-    logger.info("rendering video")
-    if not render_video(local_video_path, rendered_file_path):
-        raise Exception("rendering failed")
-
-    logger.info("uploading rendered video to key: %s", rendered_s3_key)
-    if not upload_video(s3_bucket, rendered_s3_key, rendered_file_path):
-        raise Exception("upload failed")
-
-    # No longer need source file
-    if not clean_up_file(local_video_path):
-        logger.info("failed to remove source file: %s", local_video_path)
-    if not clean_up_file(rendered_file_path):
-        logger.info("failed to remove source file: %s", rendered_file_path)
-
-    logger.info("rendering complete")
-    return {"data": "success"}
+    return command, task_types
 
 
 def download_video(s3_bucket: str, s3_key: str, file_path: str) -> bool:
     success = True
     try:
-        s3.download_file(s3_bucket, s3_key, file_path)
+        s3.download_file(Bucket=s3_bucket, Key=s3_key, Filename=file_path)
+        logger.info("download complete")
+        logger.info("file size of downloaded video: %s", os.path.getsize(file_path))
     except Exception as err:
         logger.error(err)
         success = False
     return success
 
 
-def render_video(file_path: str, rendered_file: str) -> bool:
+def render_video(file_path: str, rendered_file_path: str) -> bool:
     success = True
 
     if not os.path.isfile(file_path):
         logger.error("video file not downloaded")
         raise Exception("video file not downloaded")
 
-    ffmpeg_command = [
-        FFMPEG_DIR,
-        "-flags2",
-        "+export_mvs",
-        "-i",
-        file_path,
-        "-vf",
-        str(
-            r"split[src],codecview=mv=pf+bf+bb[vex],[vex][src]blend=all_mode=difference128,eq=contrast=7:brightness=-1:gamma=1.5"
-        ),
-        "-c:v",
-        "libx264",
-        rendered_file,
-    ]
+    logger.info("rendering video to path: %s", str(rendered_file_path))
 
-    pipe = subprocess.Popen(
-        ffmpeg_command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    ffmpeg_command = get_ffmpeg_command("h264_mp4_light", file_path, rendered_file_path)
 
-    out, err = pipe.communicate()
-    if err:
-        logger.error(err)
-        success = False
-        return success
+    res = subprocess.run(ffmpeg_command, capture_output=True)
 
-    out = out.decode("utf-8")
-    logger.debug("ffmpeg return:", out)
+    logger.info(f"response: {res}")
+
+    logger.info(f"rendered video size is {os.path.getsize(rendered_file_path)}")
 
     return success
 
 
-def upload_video(s3_bucket: str, s3_key: str, file_path: str) -> bool:
+def upload_video(s3_bucket: str, rendered_s3_key: str, rendered_file_path: str) -> bool:
     success = True
+
+    logger.info(
+        f"uploading rendered video, {rendered_file_path} to key: {rendered_s3_key}"
+    )
+
+    logger.info(
+        f"before upload, rendered video size is {os.path.getsize(rendered_file_path)}"
+    )
+
     try:
-        s3.upload_file(file_path, s3_bucket, s3_key)
+        s3.upload_file(rendered_file_path, s3_bucket, rendered_s3_key)
+        logger.info("upload complete")
     except Exception as err:
         logger.error(err)
         success = False
@@ -161,15 +161,19 @@ def get_obj_file_size(bucket: str, key: str) -> Union[int, None]:
     return object_size
 
 
-def clean_up_file(path: str) -> bool:
+def clean_up_folder(folder_path: str) -> bool:
     success = True
-    if path and os.path.exists(path):
-        logger.debug("Removing: %s", path)
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
         try:
-            os.remove(path)
-        except:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print("Failed to delete %s. Reason: %s" % (file_path, e))
             success = False
-            pass
+
     return success
 
 
@@ -194,3 +198,58 @@ def get_ffmpeg_version() -> str:
         if pos > -1:
             ffmpeg_version = stdout[15:pos]
     return ffmpeg_version
+
+
+def handler(event, context) -> dict:
+    logger.debug("videocloud_ffmpeg called: %s", event)
+    logger.debug("running ffmpeg version: %s", get_ffmpeg_version())
+
+    filename = unquote(event.get("filename", ""))
+    tasks = event.get("tasks", None)
+
+    logger.info("filename: %s, tasks: %s", filename, tasks)
+
+    s3_bucket = S3_SOURCE_BUCKET
+    s3_key = S3_SOURCE_PATH + filename
+    rendered_filename = f"{str(Path(filename).stem)}_rendered.mp4"
+    rendered_s3_key = S3_RENDERED_PATH + rendered_filename
+
+    assert s3_key != S3_SOURCE_PATH, "filename is required"
+    assert filename, "filename is required"
+    assert tasks, "task(s) are required"
+    _, task_types = get_ffmpeg_command()
+    for task in tasks:
+        assert task in task_types, f"task must be one of: {task_types}"
+
+    logger.info("bucket: %s, key: %s, task: %s", s3_bucket, s3_key, task)
+
+    # Set video path in temporary directory
+    local_video_path = f"{TEMP_DIR}/{filename}"
+    rendered_file_path = f"{TEMP_DIR}/{rendered_filename}"
+
+    # Clean tmp folder before starting
+    subprocess.call(f"rm -rf /tmp/*", shell=True)
+
+    check_available_space(s3_bucket, s3_key)
+
+    # Downloads video from s3 into temporary directory
+    logger.info("downloading video from key: %s", s3_key)
+    if not download_video(s3_bucket, s3_key, local_video_path):
+        raise Exception("download failed, file may not exist")
+
+    # Renders the video into temporary temp/rendered/ directory
+    logger.info("rendering video")
+    if not render_video(local_video_path, rendered_file_path):
+        raise Exception("rendering failed")
+
+    # Uploads rendered video to /rendered/ directory in s3
+    logger.info("uploading rendered video to key: %s", rendered_s3_key)
+    if not upload_video(s3_bucket, rendered_s3_key, rendered_file_path):
+        raise Exception("upload failed")
+
+    # No longer need source files or rendered files
+    if not clean_up_folder(folder_path=TEMP_DIR):
+        logger.info("failed to clean folder: %s", TEMP_DIR)
+
+    logger.info("rendering complete")
+    return {"data": "success"}

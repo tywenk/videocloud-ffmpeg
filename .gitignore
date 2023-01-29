@@ -129,3 +129,5 @@ dmypy.json
 .pyre/
 
 *.zip
+test*
+.DS_Store
